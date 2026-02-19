@@ -14,6 +14,9 @@ class DeployMultiPath:
     """
 
     def __init__(self, saved_model_h5, anchors):
+        # Avoid grabbing all GPU memory at once; this reduces cuDNN init failures
+        # when multiple CARLA workers start concurrently.
+        self._configure_tf_runtime()
         try:
             self.model = tf.keras.models.load_model(saved_model_h5, compile=False)
         except Exception as e:
@@ -24,6 +27,16 @@ class DeployMultiPath:
         # Check shape: should be N_A x N_T x 2.
         assert (len(self.anchors.shape) == 3 and self.anchors.shape[-1] == 2)
         self.num_anchors, self.num_timesteps, _ = self.anchors.shape
+
+    @staticmethod
+    def _configure_tf_runtime():
+        try:
+            gpus = tf.config.list_physical_devices("GPU")
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+        except Exception:
+            # Runtime may already be initialized; continue with default behavior.
+            pass
 
     def predict_instance(self, image_raw, past_states):
         if len(image_raw.shape) == 3:
@@ -55,8 +68,9 @@ class DeployMultiPath:
         for mode_id in range(self.num_anchors):
             traj_xy = (trajectories[mode_id, :, :2].numpy() + anchors[mode_id])
 
-            std1   = tf.math.exp(tf.math.abs(trajectories[mode_id, :, 2])).numpy()
-            std2   = tf.math.exp(tf.math.abs(trajectories[mode_id, :, 3])).numpy()
+            # Clamp before exp to avoid overflow -> NaN/Inf covariance.
+            std1   = tf.math.exp(tf.clip_by_value(tf.math.abs(trajectories[mode_id, :, 2]), 0.0, 10.0)).numpy()
+            std2   = tf.math.exp(tf.clip_by_value(tf.math.abs(trajectories[mode_id, :, 3]), 0.0, 10.0)).numpy()
             cos_th = tf.math.cos(trajectories[mode_id, :, 4]).numpy()
             sin_th = tf.math.sin(trajectories[mode_id, :, 4]).numpy()
 
@@ -64,8 +78,11 @@ class DeployMultiPath:
             for tm, (s1, s2, ct, st) in enumerate(zip(std1, std2, cos_th, sin_th)):
                 R_t = np.array([[ct, -st],[st, ct]])
                 D   = np.diag([s1**2, s2**2])
-                sigmas[tm] = R_t @ D @ R_t.T
-            assert np.all(~np.isnan(sigmas))
+                sigma_t = R_t @ D @ R_t.T
+                sigma_t = np.nan_to_num(sigma_t, nan=1e-3, posinf=1e3, neginf=1e-3)
+                sigma_t = 0.5 * (sigma_t + sigma_t.T) + 1e-6 * np.eye(2)
+                sigmas[tm] = sigma_t
+            sigmas = np.nan_to_num(sigmas, nan=1e-3, posinf=1e3, neginf=1e-3)
 
             mode_probs.append(anchor_probs[mode_id])
             mode_mus.append(traj_xy)

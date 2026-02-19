@@ -10,10 +10,10 @@
 		"y"                  :  0.0,
 		"visualize_opencv"   : true,
 		"save_avi"           : true,
-		"overlay_gmm"        : false,
+		"overlay_gmm"        : true,
 		"overlay_ego_info"   : true,
-		"overlay_mode_probs" : false,
-		"overlay_traj_hist"  : false
+		"overlay_mode_probs" : true,
+		"overlay_traj_hist"  : true
 	},
 	"ego_init_jsons" : [
 		"ego_init_01.json",

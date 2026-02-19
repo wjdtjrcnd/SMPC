@@ -76,14 +76,30 @@ class AgentHistory:
 		"""
 		time = world_snapshot.timestamp.elapsed_seconds
 
-		for veh_id in self.vehicles.keys():
-			self.vehicles[veh_id].update( time, world_snapshot.find(veh_id).get_transform() )
+		missing_vehicles = []
+		for veh_id in list(self.vehicles.keys()):
+			veh_snap = world_snapshot.find(veh_id)
+			if veh_snap is None:
+				missing_vehicles.append(veh_id)
+				continue
+			self.vehicles[veh_id].update(time, veh_snap.get_transform())
+		for veh_id in missing_vehicles:
+			self.vehicles.pop(veh_id, None)
 
-		for ped_id in self.pedestrians.keys():
-			self.pedestrians[ped_id].update( time, world_snapshot.find(ped_id).get_transform() )
+		missing_pedestrians = []
+		for ped_id in list(self.pedestrians.keys()):
+			ped_snap = world_snapshot.find(ped_id)
+			if ped_snap is None:
+				missing_pedestrians.append(ped_id)
+				continue
+			self.pedestrians[ped_id].update(time, ped_snap.get_transform())
+		for ped_id in missing_pedestrians:
+			self.pedestrians.pop(ped_id, None)
 
 		for tl_id in self.traffic_lights.keys():
 			tl_actor = world.get_actor(tl_id)
+			if tl_actor is None:
+				continue
 			self.traffic_lights[tl_id] = self.process_tl_actor( tl_actor )
 
 	def query(self,
@@ -95,6 +111,13 @@ class AgentHistory:
 		"""
 
 		snapshots = {}
+		if len(self.vehicles) == 0:
+			# No tracked vehicles left (e.g., world reset / actors destroyed).
+			# Return empty snapshots for all requested times instead of crashing.
+			for hsec in history_secs:
+				snapshots[np.round(hsec, 2)] = {}
+			return snapshots
+
 		arbitrary_veh_key = list(self.vehicles.keys())[0]
 		tms = np.array(self.vehicles[arbitrary_veh_key].time_history)
 		current_tm = tms[-1]

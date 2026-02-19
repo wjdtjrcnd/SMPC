@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 import carla
 import os
@@ -44,7 +44,9 @@ class CarlaParams:
     map_str               : str # e.g. "Town05"
     weather_str           : str # e.g. "ClearNoon"
     fps                   : int # what fps to run the simulator in synchronous mode
-    intersection_csv_loc  : str # file location of the csv defining the intersection
+    intersection_csv_loc  : str = "" # file location of the csv defining the intersection
+    ref_positions         : Optional[List[List[float]]] = None # optional inline [x, y, yaw] poses
+    ref_posisions         : Optional[List[List[float]]] = None # backward-compatible typo key
 
     # Carla client settings.
     ip_addr        : str   = "localhost"
@@ -91,6 +93,7 @@ class VehicleParams:
     goal_longitudinal_offset    : float      # how far to move the car's goal pose in its local fwd (i.e. longitudinal axis) direction (m)
     nominal_speed               : float      # how fast the car should travel if unobstructed / not turning
     init_speed                  : float      # the car's initial speed in simulation (m/s)
+    goal_yaw_offset             : float = 0.0# additional yaw offset applied only at goal pose (deg)
 
     # General MPC parameters.  Some of these can be ignored (e.g. n_modes if using MPCAgent).
     N         : int   = 10  # horizon of the MPC solution
@@ -129,6 +132,17 @@ def load_intersection(intersection_csv):
         goal_pose  = [float(data[3]), float(data[4]), int(data[5])]
         intersection.append( [start_pose, goal_pose] )
 
+    return intersection
+
+
+def load_intersection_from_points(intersection_points):
+    intersection = []
+    for row in intersection_points:
+        if len(row) != 3:
+            raise ValueError("Each ref_positions row must have 3 values: x, y, yaw")
+        start_pose = [float(row[0]), float(row[1]), int(row[2])]
+        goal_pose = [float(row[0]), float(row[1]), int(row[2])]
+        intersection.append([start_pose, goal_pose])
     return intersection
 
 def get_vehicle_policy(vehicle_params, vehicle_actor, goal_transform):
@@ -179,6 +193,7 @@ def get_intersection_transform(intersection, vehicle_params, endpoint_str, spawn
     endpoint_idx        = None
     left_offset         = None
     longitudinal_offset = None
+    yaw_offset_deg      = 0.0
 
     if endpoint_str == "start":
         endpoint_idx        = 0
@@ -191,6 +206,7 @@ def get_intersection_transform(intersection, vehicle_params, endpoint_str, spawn
         node_idx            = vehicle_params.intersection_goal_node_idx
         left_offset         = vehicle_params.goal_left_offset
         longitudinal_offset = vehicle_params.goal_longitudinal_offset
+        yaw_offset_deg      = float(getattr(vehicle_params, "goal_yaw_offset", 0.0))
     else:
         raise ValueError(f"Invalid endpoint:{endpoint_str}.  Expected start or goal.")
 
@@ -208,7 +224,7 @@ def get_intersection_transform(intersection, vehicle_params, endpoint_str, spawn
 
     # Make the Carla transform.
     loc = carla.Location(x = x, y = y, z = spawn_height)
-    rot = carla.Rotation(yaw=yaw_deg)
+    rot = carla.Rotation(yaw=float(yaw_deg) + yaw_offset_deg)
     # import pdb; pdb.set_trace()
     return carla.Transform(loc, rot)
 
@@ -285,16 +301,26 @@ class RunLKScenario:
         # Needed for Sync mode loop.
         self.timeout   = carla_params.timeout_period
         self.carla_fps = carla_params.fps
-        self.max_iters = self.carla_fps*30 # limit scenario run to 30 seconds max
+        self.max_iters = self.carla_fps*20 # limit scenario run to 20 seconds max
 
         # Needed for OpenCV/Carla world visualization.
         self.viz_params = drone_viz_params
         # self.mode_rgb_colors = [(255, 0, 255), (255, 255, 0)]#, (0, 255, 255)] # TODO: autogenerate
         self.mode_rgb_colors = [(255, 0, 255), (0,255, 255)]
+        yaw_mod = float(drone_viz_params.yaw) % 360.0
+        self.rotate_overlay_180 = abs(yaw_mod - 180.0) < 1e-6
+
+    def _rotate_overlay_point(self, x_px, y_px, img):
+        if not self.rotate_overlay_180:
+            return x_px, y_px
+        h, w = img.shape[:2]
+        return (w - 1 - x_px), (h - 1 - y_px)
 
     def run_scenario(self):
         # Return flag to indicate if this ran to completion.
         ran_successfully = False
+        # Ensure output directory exists even if callers modified it after __init__.
+        os.makedirs(self.savedir, exist_ok=True)
 
         # Video Setup
         writer = None
@@ -330,7 +356,7 @@ class RunLKScenario:
                     sync_mode.tick(timeout=self.timeout)
 
                 # Loop until all vehicles have reached their goal or we've exceeded self.max_iters.
-                for _ in range(self.max_iters):
+                for iter_idx in range(self.max_iters):
                     snap, img = sync_mode.tick(timeout=self.timeout)
 
                     # Handle predictions.
@@ -368,6 +394,11 @@ class RunLKScenario:
                             ego_speed = np.linalg.norm([ego_vel.x, ego_vel.y])
                             ego_ctrl  = control
                             completed = completed and policy.done()
+                            progress = 100.0 * (iter_idx + 1) / float(self.max_iters)
+                            bar_len = 30
+                            filled = int(bar_len * progress / 100.0)
+                            bar = "#" * filled + "-" * (bar_len - filled)
+                            print(f"\r[progress] [{bar}] {progress:5.1f}%", end="", flush=True)
 
                     # Get drone camera image.
                     img_drone = np.frombuffer(img.raw_data, dtype=np.uint8)
@@ -404,9 +435,12 @@ class RunLKScenario:
 
                     if completed:
                         # All cars reached their destinations, end before self.max_iters.
+                        print("", flush=True)
                         break
 
                 # Save results and mark successful completion.
+                if not completed:
+                    print("", flush=True)
                 for act_key in self.results_dict:
                     for arr_key in ["state_trajectory",
                                     "input_trajectory",
@@ -531,10 +565,20 @@ class RunLKScenario:
         self.drone = self.world.spawn_actor(bp_drone, cam_transform)
 
     def _setup_vehicles(self, vehicle_params_list, carla_params):
-        intersection_fname = os.path.join( os.path.dirname(os.path.abspath(__file__)),
-                                           carla_params.intersection_csv_loc )
-        intersection = load_intersection(intersection_fname)
+        ref_positions = carla_params.ref_positions
+        if ref_positions is None:
+            ref_positions = getattr(carla_params, "ref_posisions", None)
+        if ref_positions:
+            intersection = load_intersection_from_points(ref_positions)
+        else:
+            intersection_fname = carla_params.intersection_csv_loc
+            if not intersection_fname:
+                raise ValueError("Either ref_positions or intersection_csv_loc must be provided.")
+            if not os.path.isabs(intersection_fname):
+                intersection_fname = os.path.join(os.path.dirname(os.path.abspath(__file__)), intersection_fname)
+            intersection = load_intersection(intersection_fname)
         bp_library = self.world.get_blueprint_library()
+        world_map = self.world.get_map()
 
         self.vehicle_actors   = []
         self.vehicle_policies = []
@@ -563,7 +607,27 @@ class RunLKScenario:
             start_transform = get_intersection_transform(intersection, vp, "start")
             goal_transform  = get_intersection_transform(intersection, vp, "goal")
 
-            veh_actor  = self.world.spawn_actor(veh_bp, start_transform)
+            wp = world_map.get_waypoint(
+                start_transform.location, project_to_road=True, lane_type=carla.LaneType.Driving
+            )
+            base_z = float(start_transform.location.z)
+            z_candidates = [base_z]
+            if wp is not None:
+                road_z = float(wp.transform.location.z)
+                z_candidates = [road_z + 0.5, road_z + 1.5, base_z, base_z + 0.5, base_z + 2.0]
+
+            veh_actor = None
+            for z_try in z_candidates:
+                start_transform.location.z = z_try
+                veh_actor = self.world.try_spawn_actor(veh_bp, start_transform)
+                if veh_actor is not None:
+                    break
+            if veh_actor is None:
+                raise RuntimeError(
+                    f"Failed to spawn role={vp.role} type={vp.vehicle_type} "
+                    f"at ({start_transform.location.x:.2f}, {start_transform.location.y:.2f}) "
+                    f"with z_candidates={z_candidates} yaw={start_transform.rotation.yaw:.1f}"
+                )
             # veh_actor.set_enable_gravity(enabled=False)
             # import pdb; pdb.set_trace()
             yaw_carla = veh_actor.get_transform().rotation.yaw
@@ -640,10 +704,18 @@ class RunLKScenario:
                 for (mean_xy, covar_xy) in zip(mean_traj, covar_traj):
 
                     mu_px    = self.rot_world_to_drone @ (np.hstack((mean_xy,self.tv_z)) - self.p_drone)
-                    center_x = int(mu_px[0])+960
-                    center_y = int(mu_px[1])+540
+                    center_x = int(mu_px[0]) + img.shape[1] // 2
+                    center_y = int(mu_px[1]) + img.shape[0] // 2
+                    center_x, center_y = self._rotate_overlay_point(center_x, center_y, img)
+                    covar_xy = np.asarray(covar_xy, dtype=float)
+                    covar_xy = np.nan_to_num(covar_xy, nan=1e-3, posinf=1e3, neginf=1e-3)
                     covar_px = self.rot_world_to_drone[0:2,0:2] @ covar_xy @ self.rot_world_to_drone[0:2,0:2].T
-                    evals_px, evecs_px = np.linalg.eigh(covar_px)
+                    covar_px = 0.5 * (covar_px + covar_px.T)
+                    try:
+                        evals_px, evecs_px = np.linalg.eigh(covar_px)
+                    except Exception:
+                        continue
+                    evals_px = np.maximum(np.nan_to_num(evals_px, nan=0.0, posinf=0.0, neginf=0.0), 0.0)
                     # import pdb;pdb.set_trace()
                     length_ax1 = int( np.sqrt(mdist_sq_thresh * evals_px[0]) ) # half the first axis diameter in pixels
                     length_ax2 = int( np.sqrt(mdist_sq_thresh * evals_px[1]) ) # half the second axis diameter in pixels
@@ -651,14 +723,38 @@ class RunLKScenario:
                     cv2.ellipse( img, (center_x, center_y), (length_ax1, length_ax2), ang_1, 0, 360, color, thickness=2)
 
     def _viz_traj_hist(self, img, radius=2):
+        # Build world->drone projection if not already available from _viz_gmm.
+        if not hasattr(self, "rot_world_to_drone") or not hasattr(self, "p_drone"):
+            drone_location = self.drone.get_location()
+            self.p_drone = np.array([drone_location.x, -drone_location.y, drone_location.z])
+            scale = self.drone_img_width / (2 * self.p_drone[2] * np.tan(0.5 * self.drone_fov))
+            self.rot_world_to_drone = (
+                scale
+                * np.array([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]])
+                @ np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+                @ np.array(
+                    [
+                        [np.cos(-self.drone_pitch), 0.0, np.sin(-self.drone_pitch)],
+                        [0.0, 1.0, 0.0],
+                        [-np.sin(-self.drone_pitch), 0.0, np.cos(-self.drone_pitch)],
+                    ]
+                )
+            )
+
+        img_cx = img.shape[1] // 2
+        img_cy = img.shape[0] // 2
+
         for idx_act, (act, act_color) in enumerate(zip(self.vehicle_actors,self.vehicle_colors)):
             act_key = f"{act.attributes['role_name']}_{idx_act}"
             act_traj = self.results_dict[act_key]["state_trajectory"]
             act_color = act_color[::-1] # rgb to bgr
+            act_z = act.get_location().z
 
             for act_st in act_traj:
                 act_xy = np.array(act_st[1:3])
-                act_px = self.A_world_to_drone @ act_xy + self.b_world_to_drone
-                center_x = int(act_px[0])
-                center_y = int(act_px[1])
+                act_xyz = np.array([act_xy[0], act_xy[1], act_z])
+                act_px = self.rot_world_to_drone @ (act_xyz - self.p_drone)
+                center_x = int(act_px[0]) + img_cx
+                center_y = int(act_px[1]) + img_cy
+                center_x, center_y = self._rotate_overlay_point(center_x, center_y, img)
                 cv2.circle(img, (center_x, center_y), radius, act_color, thickness=-1)

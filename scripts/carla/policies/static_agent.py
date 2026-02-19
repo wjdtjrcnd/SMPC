@@ -316,7 +316,7 @@ class StaticAgent(object):
         # tv_Rs_fake   =  [[np.identity(2)]*self.N_PRED_TV]*self.NUM_TVS
         # self._update_obstacles(tv_refs_fake, tv_Rs_fake)
 
-        self.opti.solver("ipopt", {"expand": False, 'verbose':False}, {"max_cpu_time": 0.5, "print_level": 0, 'sb':'yes'})
+        self.opti.solver("ipopt", {"expand": False, 'verbose': False, "print_time": False}, {"max_cpu_time": 0.5, "print_level": 0, 'sb':'yes'})
 
         sol = self._solve()
 

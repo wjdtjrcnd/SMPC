@@ -5,7 +5,7 @@
 		"fps"                  : 20,
 		"_note_ref_positions"  : "Each row is [x, y, yaw_deg]. Start and goal share the same pose.",
 		"ref_positions"        : [
-			[-60.0, 0.0, 180]
+			[-30, 0.0, 180]
 		]
 	},
 	"drone_viz_params" : {
@@ -21,35 +21,21 @@
 	},
 	"vehicle_params" : [
 		
+
 		{
 			"role"                        : "target",
 			"vehicle_type"                : "vehicle.mercedes-benz.coupe",
-			"vehicle_color"               : "186, 0, 0",
+			"vehicle_color"               : "0, 0, 186",
 			"policy_type"                 : "mpc",
 			"intersection_start_node_idx" :     0,
 			"intersection_goal_node_idx"  :     0,
-			"start_left_offset"           :   5.5,
-			"goal_left_offset"            :   5.5,
-			"start_longitudinal_offset"   :  15.0,
-			"goal_longitudinal_offset"    :  215,
-			"goal_yaw_offset"            :  0.0,
-			"nominal_speed"               :  7.0,
-			"init_speed"                  :  2.0
-		},
-		{
-			"role"                        : "target",
-			"vehicle_type"                : "vehicle.mercedes-benz.coupe",
-			"vehicle_color"               : "186, 0, 0",
-			"policy_type"                 : "mpc",
-			"intersection_start_node_idx" :     0,
-			"intersection_goal_node_idx"  :     0,
-			"start_left_offset"           :   9.1,
-			"goal_left_offset"            :   9.1,
-			"start_longitudinal_offset"   : -25.0,
-			"goal_longitudinal_offset"    :  175.0,
-			"goal_yaw_offset"            :  0.0,
-			"nominal_speed"               :  7.0,
-			"init_speed"                  :  2.0
+			"start_left_offset"           :   12.7,
+			"goal_left_offset"            :   -1,
+			"start_longitudinal_offset"   :     0,
+			"goal_longitudinal_offset"    :  140.0,
+			"goal_yaw_offset"            :  15.0,
+			"nominal_speed"               :  30.0,
+			"init_speed"                  :  30.0
 		},
 		{
 			"role"                        : "ego",
@@ -59,11 +45,11 @@
 			"intersection_goal_node_idx"  :    0,
 			"start_left_offset"           :  5.5,
 			"start_longitudinal_offset"   :  0.0,
-			"goal_left_offset"            :  9.1,
+			"goal_left_offset"            :  5.5,
 			"goal_longitudinal_offset"    : 140.0,
-			"goal_yaw_offset"            :  0.0,
-			"nominal_speed"               : 7.5,
-			"init_speed"                  : 10.0
+			"goal_yaw_offset"            :  5.0,
+			"nominal_speed"               : 25.0,
+			"init_speed"                  : 25.0
 		}
 	]
 }

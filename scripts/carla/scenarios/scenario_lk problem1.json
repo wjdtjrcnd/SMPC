@@ -31,7 +31,7 @@
 			"start_left_offset"           :   5.5,
 			"goal_left_offset"            :   5.5,
 			"start_longitudinal_offset"   :  15.0,
-			"goal_longitudinal_offset"    :  215,
+			"goal_longitudinal_offset"    :  115,
 			"goal_yaw_offset"            :  0.0,
 			"nominal_speed"               :  7.0,
 			"init_speed"                  :  2.0
@@ -46,7 +46,7 @@
 			"start_left_offset"           :   9.1,
 			"goal_left_offset"            :   9.1,
 			"start_longitudinal_offset"   : -25.0,
-			"goal_longitudinal_offset"    :  175.0,
+			"goal_longitudinal_offset"    :  75.0,
 			"goal_yaw_offset"            :  0.0,
 			"nominal_speed"               :  7.0,
 			"init_speed"                  :  2.0
@@ -60,7 +60,7 @@
 			"start_left_offset"           :  5.5,
 			"start_longitudinal_offset"   :  0.0,
 			"goal_left_offset"            :  9.1,
-			"goal_longitudinal_offset"    : 140.0,
+			"goal_longitudinal_offset"    : 40.0,
 			"goal_yaw_offset"            :  0.0,
 			"nominal_speed"               : 7.5,
 			"init_speed"                  : 10.0

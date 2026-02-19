@@ -90,6 +90,7 @@ class VehicleParams:
     goal_longitudinal_offset    : float      # how far to move the car's goal pose in its local fwd (i.e. longitudinal axis) direction (m)
     nominal_speed               : float      # how fast the car should travel if unobstructed / not turning
     init_speed                  : float      # the car's initial speed in simulation (m/s)
+    goal_yaw_offset             : float = 0.0# additional yaw offset applied only at goal pose (deg)
 
     # General MPC parameters.  Some of these can be ignored (e.g. n_modes if using MPCAgent).
     N         : int   = 10  # horizon of the MPC solution
@@ -178,6 +179,7 @@ def get_intersection_transform(intersection, vehicle_params, endpoint_str, spawn
     endpoint_idx        = None
     left_offset         = None
     longitudinal_offset = None
+    yaw_offset_deg      = 0.0
 
     if endpoint_str == "start":
         endpoint_idx        = 0
@@ -190,12 +192,13 @@ def get_intersection_transform(intersection, vehicle_params, endpoint_str, spawn
         node_idx            = vehicle_params.intersection_goal_node_idx
         left_offset         = vehicle_params.goal_left_offset
         longitudinal_offset = vehicle_params.goal_longitudinal_offset
+        yaw_offset_deg      = float(getattr(vehicle_params, "goal_yaw_offset", 0.0))
     else:
         raise ValueError(f"Invalid endpoint:{endpoint_str}.  Expected start or goal.")
 
     # Extract the pose from the intersection definition.
-    x, y, yaw_deg = intersection[node_idx][endpoint_idx]
-    yaw_rad = np.radians(float(yaw_deg))
+    x, y, yaw_base_deg = intersection[node_idx][endpoint_idx]
+    yaw_rad = np.radians(float(yaw_base_deg))
 
     # Translate the pose given the longitudinal offset.
     x += longitudinal_offset * np.cos(yaw_rad)
@@ -208,7 +211,7 @@ def get_intersection_transform(intersection, vehicle_params, endpoint_str, spawn
 
     # Make the Carla transform.
     loc = carla.Location(x = x, y = y, z = spawn_height)
-    rot = carla.Rotation(yaw=yaw_deg)
+    rot = carla.Rotation(yaw=float(yaw_base_deg) + yaw_offset_deg)
     return carla.Transform(loc, rot)
 
 def transform_to_local_frame(motion_hist_array):
@@ -284,11 +287,19 @@ class RunIntersectionScenario:
         # Needed for Sync mode loop.
         self.timeout   = carla_params.timeout_period
         self.carla_fps = carla_params.fps
-        self.max_iters = self.carla_fps*30 # limit scenario run to 30 seconds max
+        self.max_iters = self.carla_fps*20 # limit scenario run to 20 seconds max
 
         # Needed for OpenCV/Carla world visualization.
         self.viz_params = drone_viz_params
         self.mode_rgb_colors = [(255, 0, 255), (255, 255, 0), (0, 255, 255)] # TODO: autogenerate
+        self.path_palette = {
+            "ego_hist": (255, 214, 102),
+            "tv_hist": [(167, 139, 250), (247, 140, 108), (128, 223, 255)],
+            "ego_ref": (255, 255, 255),
+            "tv_ref": [(186, 255, 201), (191, 219, 254), (255, 214, 165)],
+            "ego_plan": (99, 102, 241),
+            "tv_plan": [(244, 114, 182), (56, 189, 248), (250, 204, 21)],
+        }
 
     def run_scenario(self):
         # Return flag to indicate if this ran to completion.
@@ -327,9 +338,13 @@ class RunIntersectionScenario:
                 for _ in range(2):
                     sync_mode.tick(timeout=self.timeout)
 
+                sim_start_elapsed = None
                 # Loop until all vehicles have reached their goal or we've exceeded self.max_iters.
                 for _ in range(self.max_iters):
                     snap, img = sync_mode.tick(timeout=self.timeout)
+                    if sim_start_elapsed is None:
+                        # Align logged time with first recorded frame (video/pkl t=0 at scenario start).
+                        sim_start_elapsed = float(snap.elapsed_seconds)
 
                     # Handle predictions.
                     self.agent_history.update(snap, self.world)
@@ -337,13 +352,13 @@ class RunIntersectionScenario:
                     pred_dict={ "tvs_positions": tvs_positions, "tvs_mode_dists": tvs_mode_dists}
 
                     # Run policies for each agent.
-                    t_elapsed = snap.elapsed_seconds
+                    t_elapsed = float(snap.elapsed_seconds) - sim_start_elapsed
                     completed = True
 
                     for idx_act, (act, policy) in enumerate(zip(self.vehicle_actors, self.vehicle_policies)):
                         control, z0, u0, is_feasible, solve_time = policy.run_step(pred_dict)
                         if not policy.done():
-                            z0 = np.append(t_elapsed, z0) # add the Carla timestamp
+                            z0 = np.append(t_elapsed, z0) # add scenario-relative timestamp
                             act_key = f"{act.attributes['role_name']}_{idx_act}"
                             self.results_dict[act_key]["state_trajectory"].append(z0)
                             self.results_dict[act_key]["input_trajectory"].append(u0)
@@ -377,6 +392,8 @@ class RunIntersectionScenario:
 
                     if self.viz_params.overlay_traj_hist:
                         self._viz_traj_hist(img_drone)
+                        self._viz_vehicle_references(img_drone)
+                        self._viz_planned_trajectories(img_drone)
 
                     if self.viz_params.overlay_mode_probs:
                         if tvs_valid_pred[0]: # TODO: generalize this to multiple TVs.
@@ -478,9 +495,11 @@ class RunIntersectionScenario:
         # cam_loc = carla.Location(x=-10.,
         #                          y=0.,
         #                          z=10.)
+        yaw_deg = float(drone_viz_params.yaw)
+        self.overlay_px_rotate_180 = int(round(yaw_deg)) % 360 == 180
         cam_ori = carla.Rotation(roll=drone_viz_params.roll,
                                  pitch=drone_viz_params.pitch,
-                                 yaw=drone_viz_params.yaw)
+                                 yaw=yaw_deg)
         # cam_ori = carla.Rotation(pitch=-15)
 
         cam_transform = carla.Transform(cam_loc, cam_ori)
@@ -491,6 +510,18 @@ class RunIntersectionScenario:
         bp_drone.set_attribute('role_name', 'drone')
 
         self.drone = self.world.spawn_actor(bp_drone, cam_transform)
+
+    def _overlay_px(self, x, y, img):
+        xi, yi = int(x), int(y)
+        if self.overlay_px_rotate_180:
+            return img.shape[1] - 1 - xi, img.shape[0] - 1 - yi
+        return xi, yi
+
+    def _agent_color(self, idx_act, key):
+        if idx_act == self.ego_vehicle_idx:
+            return self.path_palette[f"ego_{key}"]
+        vals = self.path_palette[f"tv_{key}"]
+        return vals[(idx_act - 1) % len(vals)]
 
     def _setup_vehicles(self, vehicle_params_list, carla_params):
         intersection_fname = os.path.join( os.path.dirname(os.path.abspath(__file__)),
@@ -540,14 +571,23 @@ class RunIntersectionScenario:
         self.tv_vehicle_idxs = tv_vehicle_idxs
 
     def _setup_predictions(self, prediction_params):
+        def _show_init(step, total, msg):
+            pct = 100.0 * step / float(total)
+            print(f"[multipath-init] {pct:5.1f}% {msg}", flush=True)
+
+        total_steps = 4
+        _show_init(1, total_steps, "agent history")
         self.agent_history = AgentHistory(self.world.get_actors())
+        _show_init(2, total_steps, "rasterizer")
         self.rasterizer    = SemBoxRasterizer(self.world.get_map().get_topology(), render_traffic_lights=\
                                                  prediction_params.render_traffic_lights)
         prefix             = os.path.abspath(__file__).split('carla')[0] + 'models/'
+        _show_init(3, total_steps, "load model")
         self.pred_model    = DeployMultiPath(prefix+prediction_params.model_weights, \
                                              np.load(prefix+prediction_params.model_anchors))
 
         # Try to do a sample prediction, initialize and check GPU model is working fine.
+        _show_init(4, total_steps, "warmup inference")
         blank_image = np.zeros((self.rasterizer.sem_rast.raster_height,
                                 self.rasterizer.sem_rast.raster_width,
                                 3), dtype=np.uint8)
@@ -569,8 +609,7 @@ class RunIntersectionScenario:
             color = color[::-1] # rgb to bgr
             for (mean_xy, covar_xy) in zip(mean_traj, covar_traj):
                 mu_px    = self.A_world_to_drone @ mean_xy + self.b_world_to_drone
-                center_x = int(mu_px[0])
-                center_y = int(mu_px[1])
+                center_x, center_y = self._overlay_px(mu_px[0], mu_px[1], img)
                 covar_px = self.A_world_to_drone @ covar_xy @ self.A_world_to_drone.T
                 evals_px, evecs_px = np.linalg.eigh(covar_px)
 
@@ -580,14 +619,65 @@ class RunIntersectionScenario:
                 cv2.ellipse( img, (center_x, center_y), (length_ax1, length_ax2), ang_1, 0, 360, color, thickness=2)
 
     def _viz_traj_hist(self, img, radius=2):
-        for idx_act, (act, act_color) in enumerate(zip(self.vehicle_actors,self.vehicle_colors)):
+        for idx_act, (act, _act_color) in enumerate(zip(self.vehicle_actors,self.vehicle_colors)):
             act_key = f"{act.attributes['role_name']}_{idx_act}"
             act_traj = self.results_dict[act_key]["state_trajectory"]
-            act_color = act_color[::-1] # rgb to bgr
+            act_color = self._agent_color(idx_act, "hist")
 
             for act_st in act_traj:
                 act_xy = np.array(act_st[1:3])
                 act_px = self.A_world_to_drone @ act_xy + self.b_world_to_drone
-                center_x = int(act_px[0])
-                center_y = int(act_px[1])
+                center_x, center_y = self._overlay_px(act_px[0], act_px[1], img)
                 cv2.circle(img, (center_x, center_y), radius, act_color, thickness=-1)
+
+    def _viz_vehicle_references(self, img, thickness=2):
+        for idx_act, policy in enumerate(self.vehicle_policies):
+            if idx_act == self.ego_vehicle_idx and hasattr(policy, "reference"):
+                # Ego: visualize the baseline start->goal reference trajectory.
+                ref_states = np.asarray(policy.reference)[:, 1:3]
+            else:
+                ref_states = getattr(policy, "latest_ref_states", None)
+                if ref_states is None and hasattr(policy, "reference"):
+                    ref_states = np.asarray(policy.reference)[:, 1:3]
+            if ref_states is None:
+                continue
+
+            ref_states = np.asarray(ref_states)
+            if ref_states.ndim != 2 or ref_states.shape[0] < 2:
+                continue
+            ref_xy = ref_states[:, :2]
+
+            color = self._agent_color(idx_act, "ref")
+            pts = []
+            for xy in ref_xy:
+                px = self.A_world_to_drone @ xy + self.b_world_to_drone
+                px_x, px_y = self._overlay_px(px[0], px[1], img)
+                pts.append([px_x, px_y])
+            pts = np.asarray(pts, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.polylines(img, [pts], isClosed=False, color=color, thickness=thickness)
+
+    def _viz_planned_trajectories(self, img, thickness=2):
+        for idx_act, policy in enumerate(self.vehicle_policies):
+            plan = getattr(policy, "latest_plan_states", None)
+            if plan is None:
+                continue
+            plan = np.asarray(plan)
+            if plan.ndim != 2:
+                continue
+            if plan.shape[1] >= 2:
+                plan_xy = plan[:, :2]
+            elif plan.shape[0] >= 2:
+                plan_xy = plan[:2, :].T
+            else:
+                continue
+            if plan_xy.shape[0] < 2:
+                continue
+
+            color = self._agent_color(idx_act, "plan")
+            pts = []
+            for xy in plan_xy:
+                px = self.A_world_to_drone @ xy + self.b_world_to_drone
+                px_x, px_y = self._overlay_px(px[0], px[1], img)
+                pts.append([px_x, px_y])
+            pts = np.asarray(pts, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.polylines(img, [pts], isClosed=False, color=color, thickness=thickness)

@@ -100,8 +100,12 @@ class RefTrajGenerator():
         # self._update_previous_input(0., 0.)
 
         # Ipopt with custom options: https://web.ca.org/docs/ -> see sec 9.1 on Opti stack.
-        p_opts = {'expand': False, 'verbose': False}
-        s_opts = { "max_cpu_time": .2, 'print_level': 0}
+        p_opts = {'expand': False, 'verbose': False, 'print_time': False}
+        s_opts = {
+            "max_cpu_time": 0.2,
+            "print_level": 0,
+            "sb": "yes",
+        }
         # s_opts = { 'print_level': 0, 'sb': 'yes'}
         self.opti.solver('ipopt', p_opts, s_opts)
 
@@ -348,7 +352,7 @@ class SMPC_MMPreds():
                        'FeasibilityTol' : 1e-2, 
                        'BarConvTol':1e-2, 
                        'BarQCPConvTol':1e-2}
-        p_opts_grb = {'error_on_fail':0}
+        p_opts_grb = {'error_on_fail': 0, 'print_time': False}
 
 
         for i in range((self.t_bar_max)*self.N_TV_max):
@@ -493,28 +497,94 @@ class SMPC_MMPreds():
         T=self.T_tv[i]
         c=self.c_tv[i]
 
+        def _as_cov_2x2(raw_sigma):
+            s = np.asarray(raw_sigma, dtype=float)
+            s = np.nan_to_num(s, nan=1e-3, posinf=1e3, neginf=1e-3)
+            if s.ndim == 0:
+                v = float(s)
+                cov = np.diag([max(v, 1e-6), max(v, 1e-6)])
+            elif s.shape == (2, 2):
+                cov = s
+            elif s.ndim == 1:
+                if s.size >= 4:
+                    cov = s[:4].reshape(2, 2)
+                elif s.size >= 2:
+                    cov = np.diag(np.maximum(s[:2], 1e-6))
+                else:
+                    v = float(s[0]) if s.size == 1 else 1e-3
+                    cov = np.diag([max(v, 1e-6), max(v, 1e-6)])
+            else:
+                # Handle shapes like (2,1), (1,2), (m,n) by flattening fallback.
+                flat = s.reshape(-1)
+                if flat.size >= 4:
+                    cov = flat[:4].reshape(2, 2)
+                elif flat.size >= 2:
+                    cov = np.diag(np.maximum(flat[:2], 1e-6))
+                else:
+                    v = float(flat[0]) if flat.size == 1 else 1e-3
+                    cov = np.diag([max(v, 1e-6), max(v, 1e-6)])
+
+            # Ensure symmetric positive-definite-ish matrix for eigh/cholesky-like usage.
+            cov = 0.5 * (cov + cov.T)
+            cov += 1e-6 * np.eye(2)
+            return cov
+
         for k in range(N_TV):
+            mu_k = np.asarray(mu_tv[k])
+            sigma_k = np.asarray(sigma_tv[k])
             for j in range(self.N_modes):
+                # Accept both with-mode and without-mode layouts.
+                # mu:    (N_modes, N, 2) or (N, 2)
+                # sigma: (N_modes, N, 2, 2) or (N, 2, 2)
+                if mu_k.ndim == 3:
+                    j_mu = min(j, mu_k.shape[0] - 1)
+                    mu_kj = mu_k[j_mu]
+                elif mu_k.ndim == 2:
+                    mu_kj = mu_k
+                else:
+                    raise ValueError(f"Unexpected mu_tv[{k}] shape: {mu_k.shape}")
+
+                if sigma_k.ndim == 4:
+                    j_sigma = min(j, sigma_k.shape[0] - 1)
+                    sigma_kj = sigma_k[j_sigma]
+                elif sigma_k.ndim == 3:
+                    sigma_kj = sigma_k
+                else:
+                    raise ValueError(f"Unexpected sigma_tv[{k}] shape: {sigma_k.shape}")
+
+                mu_len = max(1, mu_kj.shape[0])
+                sigma_len = max(1, sigma_kj.shape[0])
+
                 for t in range(self.N+1):
+                    t_mu = min(t, mu_len - 1)
+                    t_mu_prev = min(max(t - 1, 0), mu_len - 1)
+                    t_sigma = min(t, sigma_len - 1)
+                    t_sigma_prev = min(max(t - 1, 0), sigma_len - 1)
                     if t==0:
                         self.opti[i].set_value(self.x_tv_ref[i][k][j][0], x_tv0[k])
                         self.opti[i].set_value(self.y_tv_ref[i][k][j][0], y_tv0[k])
                         self.opti[i].set_value(T[k][j][t], np.identity(2))
-                        self.opti[i].set_value(c[k][j][t], mu_tv[k][j, t, :]-np.hstack((x_tv0[k],y_tv0[k])))
+                        self.opti[i].set_value(c[k][j][t], mu_kj[t_mu, :]-np.hstack((x_tv0[k],y_tv0[k])))
                         
-                        e_val,e_vec= np.linalg.eigh(0.1*sigma_tv[k][j,t,:,:])
+                        sigma_t = _as_cov_2x2(0.1 * sigma_kj[t_sigma])
+                        e_val,e_vec= np.linalg.eigh(sigma_t)
+                        e_val = np.maximum(e_val, 1e-9)
                         self.opti[i].set_value(self.Sigma_tv_sqrt[i][k][j][t], e_vec@np.diag(np.sqrt(e_val))@e_vec.T)
                     else:
-                        self.opti[i].set_value(self.x_tv_ref[i][k][j][t], mu_tv[k][j,t-1,0])
-                        self.opti[i].set_value(self.y_tv_ref[i][k][j][t], mu_tv[k][j,t-1,1])
+                        self.opti[i].set_value(self.x_tv_ref[i][k][j][t], mu_kj[t_mu_prev,0])
+                        self.opti[i].set_value(self.y_tv_ref[i][k][j][t], mu_kj[t_mu_prev,1])
                         if t<self.N:
-                            e_val,e_vec= np.linalg.eigh(0.1*sigma_tv[k][j,t,:,:])
-                            e_valp,e_vecp= np.linalg.eigh(0.1*sigma_tv[k][j,t-1,:,:])
+                            sigma_t = _as_cov_2x2(0.1 * sigma_kj[t_sigma])
+                            sigma_tp = _as_cov_2x2(0.1 * sigma_kj[t_sigma_prev])
+                            e_val,e_vec= np.linalg.eigh(sigma_t)
+                            e_valp,e_vecp= np.linalg.eigh(sigma_tp)
+                            e_val = np.maximum(e_val, 1e-9)
+                            e_valp = np.maximum(e_valp, 1e-9)
                             Ttv=e_vec@np.diag(np.sqrt(e_val))@e_vec.T@e_vecp@np.diag(np.sqrt(e_valp)**(-1))@e_vecp.T
 
                             self.opti[i].set_value(self.Sigma_tv_sqrt[i][k][j][t], e_vec@np.diag(np.sqrt(e_val))@e_vec.T )
                             self.opti[i].set_value(T[k][j][t], Ttv)
-                            self.opti[i].set_value(c[k][j][t], mu_tv[k][j, t, :]-Ttv@mu_tv[k][j, t-1, :])
+                            self.opti[i].set_value(c[k][j][t], mu_kj[t_mu, :]-Ttv@mu_kj[t_mu_prev, :])
 
 
 
@@ -612,7 +682,7 @@ class SMPC_MMPreds():
         self.opti[i].subject_to( self.DF_DOT_MIN-slack<=(-self.u_prev[i][1]+self.df_lin[i][0]+h[0][1,0])*self.fps)
         self.opti[i].subject_to((-self.u_prev[i][1]+self.df_lin[i][0]+h[0][1,0])*self.fps<=slack+self.DF_DOT_MAX)
 
-        mode = lambda m, v: int(m/N_TV)*(v==1) + (m%N_TV)*(v==0) 
+        mode = lambda m, v: (m // (self.N_modes ** v)) % self.N_modes
 
         total_prob=0
 
@@ -714,16 +784,29 @@ class SMPC_MMPreds():
         N_TV=1+int(i/self.t_bar_max)
         t_bar=i-(N_TV-1)*self.t_bar_max
 
+        def _to_numpy(val):
+            # Handle scipy sparse matrices, CasADi matrices, and plain scalars/arrays.
+            if hasattr(val, "toarray"):
+                return np.asarray(val.toarray())
+            if hasattr(val, "full"):
+                return np.asarray(val.full())
+            return np.asarray(val)
 
-        def _get_mode_collision_prob(sol, m):
-            prob =sol.value(self.probs[i][m])
+        def _to_float_scalar(val):
+            arr = _to_numpy(val).squeeze()
+            return float(np.asarray(arr).reshape(-1)[0])
+
+
+        def _get_mode_collision_prob(value_fn, m):
+            prob = _to_float_scalar(value_fn(self.probs[i][m]))
             collision_prob = 0
             for t in range(1, self.N):
                 collision_prob_t = 0
                 for k in range(N_TV): 
-                    z= sol.value(self.collision_avoidance[i][m][t][k]['z']).toarray().squeeze()
-                    y = sol.value(self.collision_avoidance[i][m][t][k]['y'])
-                    noise_samples = np.random.normal(np.zeros(z.shape[-1]), 1, size=(100, z.shape[-1]))
+                    z = np.atleast_1d(_to_numpy(value_fn(self.collision_avoidance[i][m][t][k]['z'])).squeeze()).astype(float).reshape(-1)
+                    y = _to_float_scalar(value_fn(self.collision_avoidance[i][m][t][k]['y']))
+                    z_dim = z.size
+                    noise_samples = np.random.normal(np.zeros(z_dim), 1, size=(100, z_dim))
                     for s in range(100):
                         collision_prob_t += prob/100*int((y+z@noise_samples[s])>0)
 
@@ -741,9 +824,10 @@ class SMPC_MMPreds():
             v_tp1      = sol.value(self.v_lin[i][1]+self.dz_curr[i][3]+self.DT*self.policy[i][0][0][0,0])
             is_feas     = True
 
+            val_fn = lambda expr: sol.value(expr)
             collision_prob = 0
             for m in range(1+(-1+self.N_modes**N_TV)*(t_bar>0)):
-                collision_prob+=_get_mode_collision_prob(sol, m)
+                collision_prob+=_get_mode_collision_prob(val_fn, m)
 
 
             
@@ -766,13 +850,14 @@ class SMPC_MMPreds():
 
 
             if self.opti[i].stats()['return_status']=='SUBOPTIMAL':
+                val_fn = self.opti[i].debug.value
                 u_control  = self.opti[i].debug.value(self.policy[i][0][0][:2,0])
                 v_tp1      = self.opti[i].debug.value(self.v_lin[i][1]+self.dz_curr[i][3]+self.DT*self.policy[i][0][0][0,0])
                 is_feas     = True
 
                 collision_prob = 0
                 for m in range(1+(-1+self.N_modes**N_TV)*(t_bar>0)):
-                    collision_prob+=_get_mode_collision_prob(sol, m)
+                    collision_prob+=_get_mode_collision_prob(val_fn, m)
                 z_lin_ev   = self.opti[i].debug.value(self.z_lin[i])
                 u_lin_ev   = self.opti[i].debug.value(self.u_lin[i])
                 z_ref_ev   = self.opti[i].debug.value(self.z_ref[i])
@@ -1007,7 +1092,7 @@ class SMPC_MMPreds_OBCA():
 
 
         p_opts_grb = {'OutputFlag': 0, 'FeasibilityTol' : 1e-3, 'PSDTol' : 1e-3}
-        s_opts_grb = {'error_on_fail':0}
+        s_opts_grb = {'error_on_fail': 0, 'print_time': False}
 
 
         for i in range((self.t_bar_max)*self.N_TV_max):
@@ -1148,12 +1233,15 @@ class SMPC_MMPreds_OBCA():
                         self.opti[i].set_value(T[k][j][t], np.identity(2))
                         self.opti[i].set_value(c[k][j][t], mu_tv[k][j, t, :]-np.hstack((x_tv0[k],y_tv0[k])))
                         e_val,e_vec= np.linalg.eigh(sigma_tv[k][j,t,:,:])
+                        e_val = np.maximum(e_val, 1e-9)
                         self.opti[i].set_value(self.Sigma_tv_sqrt[i][k][j][t], e_vec@np.diag(np.sqrt(e_val))@e_vec.T)
 
                     else:
 
                         e_val,e_vec= np.linalg.eigh(sigma_tv[k][j,t,:,:])
                         e_valp,e_vecp= np.linalg.eigh(sigma_tv[k][j,t-1,:,:])
+                        e_val = np.maximum(e_val, 1e-9)
+                        e_valp = np.maximum(e_valp, 1e-9)
                         Ttv=e_vec@np.diag(np.sqrt(e_val))@e_vec.T@e_vecp@np.diag(np.sqrt(e_valp)**(-1))@e_vecp.T
 
                         self.opti[i].set_value(self.Sigma_tv_sqrt[i][k][j][t], ca.chol(sigma_tv[k][j,t,:,:]) )
@@ -1732,7 +1820,7 @@ class SMPC_MMPreds_OL():
         self.opti=ca.Opti("conic")
         s_opts_grb = {'OutputFlag': 0, 'PSDTol' : 1e-3}
         
-        p_opts_grb = {'error_on_fail':0}
+        p_opts_grb = {'error_on_fail': 0, 'print_time': False}
 
         self.opti.solver("gurobi", p_opts_grb, s_opts_grb)
 
@@ -1864,7 +1952,7 @@ class SMPC_MMPreds_OL():
         E_block[0:4, 0:4]=E
         H=h[:,0]
 
-        mode = lambda m, v: int(m/N_TV)*(v==1) + (m%N_TV)*(v==0)
+        mode = lambda m, v: (m // (self.N_modes ** v)) % self.N_modes
         for t in range(1,self.N):
             for j in range(self.N_modes**N_TV):
                 oa_ref=[self._oa_ev_ref([self.x_lin[t-1], self.x_lin[t]], [self.y_lin[t-1], self.y_lin[t]], self.Mu_tv[k][mode(j,k)][t-1,0], self.Mu_tv[k][mode(j,k)][t-1,1], self.Q_tv[k][mode(j,k)][t-1]) for k in range(N_TV)]
@@ -2045,14 +2133,44 @@ class SMPC_MMPreds_OL():
         self.opti.set_value(self.df_lin,   df_ref)
 
     def _update_tv_preds(self, mu_tv, sigma_tv):
+        n_tv_in = min(len(mu_tv), self.N_TV_max)
 
-        for k in range(self.N_TV_max):
-            for j in range(self.N_modes):
-                self.opti.set_value(self.Mu_tv[k][j], mu_tv[k][j,:,:] )
+        # Populate available TV predictions.
+        for k in range(n_tv_in):
+            mu_k = np.asarray(mu_tv[k])
+            sigma_k = np.asarray(sigma_tv[k])
+            n_modes_in = min(mu_k.shape[0], self.N_modes) if mu_k.ndim == 3 else 0
+
+            for j in range(n_modes_in):
+                self.opti.set_value(self.Mu_tv[k][j], mu_k[j, :, :])
                 for t in range(self.N):
-                    self.opti.set_value(self.Sigma_tv[k][j][t], sigma_tv[k][j,t,:,:] )
-                    e_val,e_vec= np.linalg.eigh(sigma_tv[k][j,t,:,:])
-                    self.opti.set_value(self.Sigma_tv_sqrt[k][j][t], e_vec@np.diag(np.sqrt(e_val))@e_vec.T )
+                    sigma_jt = sigma_k[j, t, :, :]
+                    self.opti.set_value(self.Sigma_tv[k][j][t], sigma_jt)
+                    e_val, e_vec = np.linalg.eigh(sigma_jt)
+                    e_val = np.maximum(e_val, 1e-9)
+                    self.opti.set_value(self.Sigma_tv_sqrt[k][j][t], e_vec @ np.diag(np.sqrt(e_val)) @ e_vec.T)
+
+            # If fewer modes are provided than expected, pad remaining modes with the first mode.
+            if n_modes_in > 0 and n_modes_in < self.N_modes:
+                for j in range(n_modes_in, self.N_modes):
+                    self.opti.set_value(self.Mu_tv[k][j], mu_k[0, :, :])
+                    for t in range(self.N):
+                        sigma_jt = sigma_k[0, t, :, :]
+                        self.opti.set_value(self.Sigma_tv[k][j][t], sigma_jt)
+                        e_val, e_vec = np.linalg.eigh(sigma_jt)
+                        e_val = np.maximum(e_val, 1e-9)
+                        self.opti.set_value(self.Sigma_tv_sqrt[k][j][t], e_vec @ np.diag(np.sqrt(e_val)) @ e_vec.T)
+
+        # If fewer TVs are provided than N_TV_max, pad the missing TVs far away.
+        if n_tv_in < self.N_TV_max:
+            far_mu = np.tile(np.array([[1.0e4, 1.0e4]]), (self.N, 1))
+            unit_cov = np.identity(2)
+            for k in range(n_tv_in, self.N_TV_max):
+                for j in range(self.N_modes):
+                    self.opti.set_value(self.Mu_tv[k][j], far_mu)
+                    for t in range(self.N):
+                        self.opti.set_value(self.Sigma_tv[k][j][t], unit_cov)
+                        self.opti.set_value(self.Sigma_tv_sqrt[k][j][t], unit_cov)
 
     def _update_previous_input(self, acc_prev, df_prev):
         self.opti.set_value(self.u_prev, [acc_prev, df_prev])

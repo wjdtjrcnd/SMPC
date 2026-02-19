@@ -121,10 +121,10 @@ class SMPCAgent(object):
         if not self.ol_flag:
             if not self.obca_flag:
                 self.SMPC=smpc.SMPC_MMPreds(N=self.N, DT=self.dt, N_modes_MAX=self.N_modes, NS_BL_FLAG=self.ns_bl_flag, fixed_risk=self.fixed_risk,
-                                    L_F=self.lf, L_R=self.lr, fps=self.fps)
+                                    L_F=self.lf, L_R=self.lr, fps=self.fps, N_TV_MAX=2)
             else:
                 self.SMPC=smpc.SMPC_MMPreds_OBCA(N=self.N, DT=self.dt, N_modes_MAX=self.N_modes, NS_BL_FLAG=self.ns_bl_flag,
-                                        L_F=self.lf, L_R=self.lr, fps=self.fps, pol_mode=self.obca_mode)
+                                        L_F=self.lf, L_R=self.lr, fps=self.fps, pol_mode=self.obca_mode, N_TV_MAX=2)
         else:
             self.SMPC=smpc.SMPC_MMPreds_OL(N=self.N, DT=self.dt, N_modes_MAX=self.N_modes,
                                           L_F=self.lf, L_R=self.lr, fps=self.fps)
@@ -324,11 +324,59 @@ class SMPCAgent(object):
 
             ## TV shapes estimate along prediction horizon
 
-            Rs_ev=[np.array([[np.cos(l_states[t,2]),np.sin(l_states[t,2])],[-np.sin(l_states[t,2]), np.cos(l_states[t,2])]]) for t in range(1,self.N+1)]
+            # Guard against accidental singleton dimensions (e.g. shape (1,))
+            # so all rotation matrices stay strict 2x2 arrays.
+            Rs_ev = []
+            for t in range(1, self.N + 1):
+                psi_t = float(np.asarray(l_states[t, 2]).reshape(-1)[0])
+                Rs_ev.append(
+                    np.array(
+                        [
+                            [np.cos(psi_t), np.sin(psi_t)],
+                            [-np.sin(psi_t), np.cos(psi_t)],
+                        ],
+                        dtype=float,
+                    )
+                )
 
 
-            tv_theta=[[np.arctan2(np.diff(target_vehicle_gmm_preds[0][k][j,:,1]), np.diff(target_vehicle_gmm_preds[0][k][j,:,0])) for j in range(self.N_modes)] for k in range(N_TV)]
-            tv_R=[[[np.array([[np.cos(tv_theta[k][j][i]), np.sin(tv_theta[k][j][i])],[-np.sin(tv_theta[k][j][i]), np.cos(tv_theta[k][j][i])]]) for i in range(self.N-1)] for j in range(self.N_modes)] for k in range(N_TV)]
+            # target_vehicle_gmm_preds layout:
+            # [ [mus_tv0, sigmas_tv0], [mus_tv1, sigmas_tv1], ... ]
+            tv_mus = [target_vehicle_gmm_preds[k][0] for k in range(N_TV)]
+            tv_sigmas = [target_vehicle_gmm_preds[k][1] for k in range(N_TV)]
+
+            tv_theta = [
+                [
+                    np.arctan2(
+                        np.diff(tv_mus[k][j, :, 1]),
+                        np.diff(tv_mus[k][j, :, 0]),
+                    )
+                    for j in range(self.N_modes)
+                ]
+                for k in range(N_TV)
+            ]
+            tv_R = [
+                [
+                    [
+                        np.array(
+                            [
+                                [
+                                    np.cos(float(np.asarray(tv_theta[k][j][i]).reshape(-1)[0])),
+                                    np.sin(float(np.asarray(tv_theta[k][j][i]).reshape(-1)[0])),
+                                ],
+                                [
+                                    -np.sin(float(np.asarray(tv_theta[k][j][i]).reshape(-1)[0])),
+                                    np.cos(float(np.asarray(tv_theta[k][j][i]).reshape(-1)[0])),
+                                ],
+                            ],
+                            dtype=float,
+                        )
+                        for i in range(self.N - 1)
+                    ]
+                    for j in range(self.N_modes)
+                ]
+                for k in range(N_TV)
+            ]
             if self.CA_inner_approx:
                 tv_Q=np.array([[1./(3.6+self.d_min)**2, 0.],[0., 1./(1.2+self.d_min)**2]])
                 tv_shape_matrices=[[[ tv_R[k][j][i].T@tv_Q@tv_R[k][j][i] for i in range(self.N-1)] for j in range(self.N_modes)] for k in range(N_TV)]
@@ -338,10 +386,12 @@ class SMPCAgent(object):
                 for k in range(N_TV):
                     for j in range(self.N_modes):
                         for i in range(self.N-1):
-                            m_eval, m_evec= np.linalg.eigh(Rs_ev[i].T@v_Q@Rs_ev[i])
+                            R_ev = np.asarray(Rs_ev[i], dtype=float).reshape(2, 2)
+                            R_tv = np.asarray(tv_R[k][j][i], dtype=float).reshape(2, 2)
+                            m_eval, m_evec= np.linalg.eigh(R_ev.T@v_Q@R_ev)
                             m_sqrt=m_evec@np.diag(np.sqrt(m_eval))@m_evec.T
                             m_sqrt_inv=m_evec@np.diag(np.sqrt(m_eval)**(-1))@m_evec.T
-                            s_eval, s_evec= np.linalg.eigh(m_sqrt_inv@tv_R[k][j][i].T@v_Q@tv_R[k][j][i]@m_sqrt_inv)
+                            s_eval, s_evec= np.linalg.eigh(m_sqrt_inv@R_tv.T@v_Q@R_tv@m_sqrt_inv)
                             temp=s_evec@np.diag(np.power(np.sqrt(s_eval)**(-1)+1., 2)**(-1))@s_evec.T
                             tv_shape_matrices[k][j][i]=m_sqrt@temp@m_sqrt
             else:
@@ -365,7 +415,7 @@ class SMPCAgent(object):
                          'v_lin': l_states[:,3].T ,
                          'a_lin': l_inputs[:,0].T ,
                          'df_lin': l_inputs[:,1].T,
-                         'mus'  : [target_vehicle_gmm_preds[0][k] for k in range(N_TV)],     'sigmas' : [target_vehicle_gmm_preds[1][k] for k in range(N_TV)], 'acc_prev' : self.control_prev[0], 'df_prev' : self.control_prev[1],       'tv_shapes': tv_shape_matrices, 'Rs_ev': Rs_ev }
+                         'mus'  : tv_mus,     'sigmas' : tv_sigmas, 'acc_prev' : self.control_prev[0], 'df_prev' : self.control_prev[1],       'tv_shapes': tv_shape_matrices, 'Rs_ev': Rs_ev }
 
 
 
