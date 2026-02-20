@@ -23,16 +23,17 @@
 		
 
 		{
-			"role"                        : "target_2",
+			"role"                        : "target",
 			"vehicle_type"                : "vehicle.mercedes-benz.coupe",
 			"vehicle_color"               : "0, 0, 186",
 			"policy_type"                 : "mpc",
 			"intersection_start_node_idx" :     0,
 			"intersection_goal_node_idx"  :     0,
 			"start_left_offset"           :   12.7,
-			"goal_left_offset"            :   4,
+			"goal_left_offset"            :   -3.6,
 			"start_longitudinal_offset"   :     0,
-			"goal_longitudinal_offset"    :  140.0,
+			"goal_longitudinal_offset"    :  70.0,
+			"goal_yaw_offset"            :  0,
 			"nominal_speed"               :  30.0,
 			"init_speed"                  :  30.0
 		},
@@ -46,7 +47,8 @@
 			"start_longitudinal_offset"   :  0.0,
 			"goal_left_offset"            :  5.5,
 			"goal_longitudinal_offset"    : 140.0,
-			"nominal_speed"               : 25,
+			"goal_yaw_offset"            :  0,
+			"nominal_speed"               : 25.0,
 			"init_speed"                  : 25.0
 		}
 	]
