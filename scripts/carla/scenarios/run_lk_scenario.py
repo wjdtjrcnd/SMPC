@@ -1,9 +1,23 @@
 from dataclasses import dataclass
 from typing import List, Optional
 
-import carla
 import os
 import sys
+
+def _normalize_sys_path_for_pkg_resources():
+    """Avoid pkg_resources crashing when sys.path contains empty cwd entry."""
+    try:
+        cwd = os.getcwd()
+    except FileNotFoundError:
+        cwd = os.path.dirname(os.path.abspath(__file__))
+        os.chdir(cwd)
+
+    sys.path[:] = [cwd if p == "" else p for p in sys.path]
+
+
+_normalize_sys_path_for_pkg_resources()
+
+import carla
 import pdb
 import cv2
 import numpy as np
@@ -301,7 +315,7 @@ class RunLKScenario:
         # Needed for Sync mode loop.
         self.timeout   = carla_params.timeout_period
         self.carla_fps = carla_params.fps
-        self.max_iters = self.carla_fps*20 # limit scenario run to 20 seconds max
+        self.max_iters = self.carla_fps*15 # limit scenario run to 15 seconds max
 
         # Needed for OpenCV/Carla world visualization.
         self.viz_params = drone_viz_params
